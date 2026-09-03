@@ -1,0 +1,10 @@
+[project]
+name = "qq-bot"
+version = "0.2.0"
+description = "QQ AI bot using NapCatQQ and OneBot 11 WebSocket"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.28,<1",
+  "python-dotenv>=1.0,<2",
+  "websockets>=15,<16",
+]

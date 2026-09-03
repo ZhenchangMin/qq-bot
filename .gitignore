@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local secrets / machine-specific configuration
+.env
+.env.*
+!.env.example
+
+# Runtime artifacts
+*.log
+.bot.lock
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
