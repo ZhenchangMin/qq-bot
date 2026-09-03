@@ -21,18 +21,31 @@ class PromptTests(unittest.TestCase):
         self.assertIn("QQ 私聊", private)
         self.assertIn("QQ 群聊", group)
         self.assertIn("2 至 6 句", group)
-        self.assertIn("/smile", group)
+        self.assertIn("[[qqface:laugh]]", group)
+        self.assertNotIn("/doge", group)
         self.assertNotEqual(private, group)
 
-    def test_extract_qq_emoji_codes_excludes_registered_commands(self):
-        codes = bot.extract_qq_emoji_codes("你好 /smile /doge /HELP /smile /abc123 /ok!")
-        self.assertEqual(codes, ["/smile", "/doge", "/ok"])
+    def test_build_qq_message_segments_converts_internal_face_tag(self):
+        segments = bot.build_qq_message_segments("哈哈 [[qqface:laugh]]")
+        self.assertEqual(
+            segments,
+            [
+                {"type": "text", "data": {"text": "哈哈 "}},
+                {"type": "face", "data": {"id": "182"}},
+            ],
+        )
+        self.assertNotIn("qqface", json.dumps(segments, ensure_ascii=False))
 
-    def test_payload_marks_detected_qq_emoji_codes(self):
-        payload = bot.build_llm_payload([], "今天不错 /smile", scene="private")
+    def test_unknown_internal_face_tag_is_removed(self):
+        segments = bot.build_qq_message_segments("前面 [[qqface:doge]] 后面")
+        self.assertEqual(segments, [{"type": "text", "data": {"text": "前面  后面"}}])
+
+    def test_payload_describes_real_face_protocol(self):
+        payload = bot.build_llm_payload([], "今天不错", scene="private")
         system = payload["messages"][0]["content"]
-        self.assertIn("识别到这些 QQ 表情码", system)
-        self.assertIn("/smile", system)
+        self.assertIn("QQ 内置表情", system)
+        self.assertIn("[[qqface:grin]]", system)
+        self.assertIn("不要用斜杠文本模拟 QQ 表情", system)
 
     def test_payload_uses_scene_specific_output_limit(self):
         private = bot.build_llm_payload([], "hello", scene="private")
@@ -143,25 +156,48 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         await bot.handle_event(self.ws, mentioned)
         self.assertEqual(self.ws.sent[-1]["params"]["message"], "pong")
 
-    async def test_unknown_slash_english_token_is_treated_as_emoji_not_command(self):
+    async def test_received_face_segment_is_described_to_llm(self):
         seen = {}
 
         async def fake_ask(key, text, *, scene):
             seen.update(key=key, text=text, scene=scene)
-            return "收到 /smile"
+            return "收到"
 
         event = {
             "post_type": "message",
             "message_type": "private",
             "self_id": 999,
             "user_id": 123,
-            "message": [{"type": "text", "data": {"text": "/smile"}}],
+            "message": [
+                {"type": "text", "data": {"text": "哈哈"}},
+                {"type": "face", "data": {"id": "182"}},
+            ],
         }
         with patch.object(bot, "ask_llm", fake_ask):
             await bot.handle_event(self.ws, event)
 
-        self.assertEqual(seen["text"], "/smile")
-        self.assertEqual(self.ws.sent[-1]["params"]["message"], "收到 /smile")
+        self.assertEqual(seen["text"], "哈哈[QQ表情:笑哭]")
+        self.assertEqual(self.ws.sent[-1]["params"]["message"], "收到")
+
+    async def test_llm_face_tag_is_sent_as_real_onebot_face(self):
+        async def fake_ask(key, text, *, scene):
+            return "确实很好笑 [[qqface:laugh]]"
+
+        event = {
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": 999,
+            "user_id": 123,
+            "message": [{"type": "text", "data": {"text": "哈哈"}}],
+        }
+        with patch.object(bot, "ask_llm", fake_ask):
+            await bot.handle_event(self.ws, event)
+
+        message = self.ws.sent[-1]["params"]["message"]
+        self.assertEqual(message[-1], {"type": "face", "data": {"id": "182"}})
+        serialized = json.dumps(message, ensure_ascii=False)
+        self.assertNotIn("qqface", serialized)
+        self.assertNotIn("/doge", serialized)
 
     async def test_same_message_id_is_processed_only_once(self):
         calls = 0

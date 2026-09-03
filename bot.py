@@ -36,10 +36,77 @@ LLM_GROUP_MAX_INPUT_CHARS = max(256, int(os.getenv("LLM_GROUP_MAX_INPUT_CHARS", 
 BOT_INSTANCE_LOCK_PORT = int(os.getenv("BOT_INSTANCE_LOCK_PORT", "38451"))
 MESSAGE_DEDUPE_TTL_SECONDS = max(30, int(os.getenv("MESSAGE_DEDUPE_TTL_SECONDS", "600")))
 MESSAGE_DEDUPE_MAX_IDS = max(128, int(os.getenv("MESSAGE_DEDUPE_MAX_IDS", "4096")))
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v3"
 
 REGISTERED_COMMANDS = frozenset({"/help", "/ping", "/reset", "/model", "/status"})
-QQ_EMOJI_CODE_RE = re.compile(r"(?<![A-Za-z0-9_])/[A-Za-z]+(?![A-Za-z0-9_])")
+QQ_FACE_TAG_RE = re.compile(r"\[\[qqface:([a-z_]+)\]\]", re.IGNORECASE)
+
+# Stable, common QQ built-in faces. The model only sees the semantic token on
+# the left; users receive an actual OneBot `face` segment with the ID on the
+# right, never a textual slash alias such as `/something`.
+QQ_FACE_TOKEN_TO_ID = {
+    "grin": "13",       # 呲牙
+    "cry": "5",         # 流泪
+    "sob": "9",         # 大哭
+    "shy": "6",         # 害羞
+    "awkward": "10",    # 尴尬
+    "angry": "11",      # 发怒
+    "cool": "16",       # 酷
+    "roll_eyes": "22",  # 白眼
+    "sweat": "27",      # 流汗
+    "hug": "49",        # 拥抱
+    "heart": "66",      # 爱心
+    "like": "76",       # 赞
+    "victory": "79",    # 胜利
+    "clap": "99",       # 鼓掌
+    "pity": "111",      # 可怜
+    "laugh": "182",     # 笑哭
+    "thinking": "270",  # emm
+    "lol": "283",       # 狂笑
+    "thanks": "297",    # 拜谢
+    "awesome": "299",   # 牛啊
+    "yeah": "355",      # 耶
+    "emo": "382",       # emo
+}
+
+QQ_FACE_ID_TO_DESCRIPTION = {
+    "5": "流泪",
+    "6": "害羞",
+    "9": "大哭",
+    "10": "尴尬",
+    "11": "发怒",
+    "13": "呲牙",
+    "14": "微笑",
+    "16": "酷",
+    "18": "抓狂",
+    "20": "偷笑",
+    "21": "可爱",
+    "22": "白眼",
+    "27": "流汗",
+    "28": "憨笑",
+    "49": "拥抱",
+    "63": "玫瑰",
+    "66": "爱心",
+    "76": "赞",
+    "79": "胜利",
+    "98": "抠鼻",
+    "99": "鼓掌",
+    "105": "鄙视",
+    "106": "委屈",
+    "111": "可怜",
+    "118": "抱拳",
+    "123": "NO",
+    "124": "OK",
+    "182": "笑哭",
+    "270": "沉思/emm",
+    "281": "无眼笑",
+    "283": "狂笑",
+    "297": "拜谢",
+    "299": "牛啊",
+    "355": "耶",
+    "356": "666",
+    "382": "emo",
+}
 
 BASE_SYSTEM_PROMPT = os.getenv(
     "LLM_BASE_SYSTEM_PROMPT",
@@ -61,12 +128,14 @@ GROUP_SCENE_PROMPT = os.getenv(
     "除非用户明确要求详细解释，否则不要写长篇教程、长列表或大段背景知识。"
     "不要抢话题，不要假装看到了未提供给你的群聊历史。",
 )
-QQ_EMOJI_PROMPT = (
-    "QQ 中可以出现形如 /smile、/doge 的表情码：一个斜杠后紧跟连续英文字母。"
-    "除已注册 Bot 指令外，看到这种 token 时，把它当作 QQ 表情码，并根据斜杠后的英文词理解其情绪或语气。"
-    "回复时也可以在自然、确定有帮助时少量使用同格式表情码。优先复用用户消息里已经出现过的表情码；"
-    "如果自行选择，只使用明显表达情绪的英文词，不要输出 /English 这类说明性占位符。"
-    "不要为了装饰而滥用，也不要声称某个代码一定能被客户端渲染。"
+QQ_FACE_PROMPT = (
+    "你可以在合适时使用 QQ 内置表情。只允许使用以下内部标签："
+    + "、".join(
+        f"[[qqface:{token}]]({QQ_FACE_ID_TO_DESCRIPTION[face_id]})"
+        for token, face_id in QQ_FACE_TOKEN_TO_ID.items()
+    )
+    + "。这些标签是给 Bot 的机器指令，不是给用户看的文本。"
+    "通常每条回复最多使用 1 个，只有确实能改善语气时才使用；不要用斜杠文本模拟 QQ 表情。"
 )
 
 HELP_TEXT = """可用指令：
@@ -78,7 +147,7 @@ HELP_TEXT = """可用指令：
 
 私聊：直接发消息即可和 AI 对话。
 群聊：只有 @我 后面的内容才会触发回复。
-QQ 表情：除上述指令外，/smile 这类“/ + 英文字母”会作为表情码交给 AI 理解。"""
+QQ 表情：支持识别收到的常用 QQ 内置表情，AI 回复也可能直接发送真实 QQ 表情。"""
 
 # key -> [{"role": "user"|"assistant", "content": "..."}]
 conversation_history: dict[str, list[dict[str, str]]] = defaultdict(list)
@@ -220,12 +289,105 @@ async def send_text_reply(ws, event: dict, text: str) -> None:
         print(f"[reply] group={group_id}: {text[:80]!r}")
 
 
+def build_qq_message_segments(text: str) -> list[dict]:
+    """Convert internal [[qqface:token]] markers to real OneBot face segments.
+
+    Unknown internal face markers are silently removed so implementation
+    details never leak into QQ messages.
+    """
+    text = (text or "").strip()
+    segments: list[dict] = []
+    cursor = 0
+
+    def append_text(value: str) -> None:
+        if not value:
+            return
+        if segments and segments[-1].get("type") == "text":
+            segments[-1]["data"]["text"] += value
+        else:
+            segments.append({"type": "text", "data": {"text": value}})
+
+    for match in QQ_FACE_TAG_RE.finditer(text):
+        append_text(text[cursor : match.start()])
+        token = match.group(1).lower()
+        face_id = QQ_FACE_TOKEN_TO_ID.get(token)
+        if face_id:
+            segments.append({"type": "face", "data": {"id": face_id}})
+        cursor = match.end()
+
+    append_text(text[cursor:])
+    return segments
+
+
+def chunk_qq_message_segments(segments: list[dict], chunk_size: int = 3500) -> list[list[dict]]:
+    """Split long mixed text/face messages without exposing internal tags."""
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    current_chars = 0
+
+    def flush() -> None:
+        nonlocal current, current_chars
+        if current:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+
+    for segment in segments:
+        if segment.get("type") != "text":
+            current.append(segment)
+            continue
+
+        value = str((segment.get("data") or {}).get("text") or "")
+        while value:
+            remaining = chunk_size - current_chars
+            if remaining <= 0:
+                flush()
+                remaining = chunk_size
+            piece, value = value[:remaining], value[remaining:]
+            if piece:
+                current.append({"type": "text", "data": {"text": piece}})
+                current_chars += len(piece)
+            if current_chars >= chunk_size:
+                flush()
+
+    flush()
+    return chunks
+
+
+async def send_qq_segments_reply(ws, event: dict, segments: list[dict], *, preview: str = "") -> None:
+    if not segments:
+        await send_text_reply(ws, event, "模型没有返回可显示的内容。")
+        return
+
+    message_type = event.get("message_type")
+    if message_type == "private":
+        user_id = event.get("user_id")
+        if user_id is None:
+            return
+        await send_action(ws, "send_private_msg", {"user_id": user_id, "message": segments})
+        print(f"[reply] private user={user_id}: {preview[:80]!r}")
+        return
+
+    if message_type == "group":
+        group_id = event.get("group_id")
+        if group_id is None:
+            return
+        await send_action(ws, "send_group_msg", {"group_id": group_id, "message": segments})
+        print(f"[reply] group={group_id}: {preview[:80]!r}")
+
+
 async def send_long_reply(ws, event: dict, text: str, chunk_size: int = 3500) -> None:
     text = (text or "").strip()
     if not text:
         text = "模型没有返回可显示的内容。"
-    for start in range(0, len(text), chunk_size):
-        await send_text_reply(ws, event, text[start : start + chunk_size])
+    if not QQ_FACE_TAG_RE.search(text):
+        for start in range(0, len(text), chunk_size):
+            await send_text_reply(ws, event, text[start : start + chunk_size])
+        return
+    segments = build_qq_message_segments(text)
+    preview = QQ_FACE_TAG_RE.sub("[QQ表情]", text)
+    for chunk in chunk_qq_message_segments(segments, chunk_size=chunk_size):
+        await send_qq_segments_reply(ws, event, chunk, preview=preview)
 
 
 def message_segments(event: dict) -> list[dict]:
@@ -263,6 +425,13 @@ def extract_text(event: dict, *, remove_bot_mention: bool) -> str:
             data = segment.get("data") or {}
             if segment_type == "text":
                 parts.append(str(data.get("text") or ""))
+            elif segment_type == "face":
+                face_id = str(data.get("id") or "")
+                description = QQ_FACE_ID_TO_DESCRIPTION.get(face_id)
+                if description:
+                    parts.append(f"[QQ表情:{description}]")
+                elif face_id:
+                    parts.append(f"[QQ表情:id={face_id}]")
             elif segment_type == "at" and not (
                 remove_bot_mention and str(data.get("qq") or "") == self_id
             ):
@@ -292,23 +461,9 @@ def conversation_scene(event: dict) -> str:
     return "group" if event.get("message_type") == "group" else "private"
 
 
-def extract_qq_emoji_codes(text: str) -> list[str]:
-    """Return distinct /English QQ emoji codes, excluding registered commands."""
-    codes: list[str] = []
-    seen: set[str] = set()
-    for match in QQ_EMOJI_CODE_RE.finditer(text):
-        code = match.group(0)
-        lowered = code.lower()
-        if lowered in REGISTERED_COMMANDS or lowered in seen:
-            continue
-        seen.add(lowered)
-        codes.append(code)
-    return codes
-
-
 def scene_system_prompt(scene: str) -> str:
     scene_prompt = GROUP_SCENE_PROMPT if scene == "group" else PRIVATE_SCENE_PROMPT
-    return f"{BASE_SYSTEM_PROMPT}\n\n{scene_prompt}\n\n{QQ_EMOJI_PROMPT}"
+    return f"{BASE_SYSTEM_PROMPT}\n\n{scene_prompt}\n\n{QQ_FACE_PROMPT}"
 
 
 def scene_max_turns(scene: str) -> int:
@@ -332,13 +487,6 @@ def trim_history(messages: list[dict[str, str]], *, scene: str) -> list[dict[str
 
 def build_llm_payload(history: list[dict[str, str]], user_text: str, *, scene: str) -> dict:
     system_prompt = scene_system_prompt(scene)
-    emoji_codes = extract_qq_emoji_codes(user_text)
-    if emoji_codes:
-        system_prompt += (
-            "\n\n本条用户消息中识别到这些 QQ 表情码："
-            + "、".join(emoji_codes)
-            + "。结合斜杠后的英文词理解它们表达的情绪或语气。"
-        )
     messages = [
         {"role": "system", "content": system_prompt},
         *history,
